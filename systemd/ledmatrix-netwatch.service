@@ -1,0 +1,14 @@
+[Unit]
+Description=LED Matrix Network Watchdog (AP fallback)
+After=network.target
+Wants=network.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/ledmatrix-netctl --config /home/pi/.config/ledmatrix/network.json watch --interval 5
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

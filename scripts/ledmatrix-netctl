@@ -1,0 +1,408 @@
+#!/usr/bin/env python3
+import argparse
+import json
+import os
+import random
+import string
+import subprocess
+import sys
+import time
+import urllib.request
+
+WIFI_CONN = "ledmatrix-wifi"
+ETH_CONN = "ledmatrix-eth"
+AP_CONN = "ledmatrix-ap"
+DEFAULT_CONFIG_PATH = os.path.join(os.path.expanduser("~"), ".config", "ledmatrix", "network.json")
+
+
+def _run(cmd, check=True):
+    return subprocess.run(cmd, check=check, text=True, capture_output=True)
+
+
+def nmcli(args, check=True):
+    return _run(["nmcli"] + args, check=check)
+
+
+def load_config(path):
+    cfg = {
+        "wifi": {
+            "ssid": "",
+            "psk": "",
+            "dhcp": True,
+            "address": "",
+            "gateway": "",
+            "dns": "",
+        },
+        "ethernet": {
+            "dhcp": True,
+            "address": "",
+            "gateway": "",
+            "dns": "",
+        },
+        "ap_fallback": {
+            "enabled": False,
+            "ssid_prefix": "LEDMatrix",
+            "password_length": 12,
+            "ssid": "",
+            "password": "",
+            "channel": 6,
+        },
+    }
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        for section in ("wifi", "ethernet", "ap_fallback"):
+            if isinstance(raw.get(section), dict):
+                cfg[section].update(raw[section])
+    except FileNotFoundError:
+        pass
+    return cfg
+
+
+def save_config(path, cfg):
+    base_dir = os.path.dirname(path)
+    if base_dir:
+        os.makedirs(base_dir, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2, sort_keys=True, ensure_ascii=True)
+
+
+def _connection_names():
+    result = nmcli(["-t", "-f", "NAME", "con", "show"], check=False)
+    if result.returncode != 0:
+        return set()
+    return {line.strip() for line in result.stdout.splitlines() if line.strip()}
+
+
+def _active_connections():
+    result = nmcli(["-t", "-f", "NAME,TYPE,DEVICE", "con", "show", "--active"], check=False)
+    active = []
+    if result.returncode != 0:
+        return active
+    for line in result.stdout.splitlines():
+        parts = line.split(":")
+        if len(parts) >= 3:
+            active.append({"name": parts[0], "type": parts[1], "device": parts[2]})
+    return active
+
+
+def _dev_fields(device, fields):
+    result = nmcli(["-t", "-f", ",".join(fields), "dev", "show", device], check=False)
+    data = {}
+    if result.returncode != 0:
+        return data
+    for line in result.stdout.splitlines():
+        if ":" not in line:
+            continue
+        key, val = line.split(":", 1)
+        data[key] = val
+    return data
+
+
+def _device_info(device):
+    fields = ["GENERAL.STATE", "GENERAL.CONNECTION", "IP4.ADDRESS"]
+    raw = _dev_fields(device, fields)
+    state_raw = raw.get("GENERAL.STATE", "")
+    state = "disconnected"
+    if "connected" in state_raw:
+        state = "connected"
+    elif "connecting" in state_raw:
+        state = "connecting"
+    elif "disconnected" in state_raw:
+        state = "disconnected"
+    elif state_raw:
+        state = state_raw
+    return {
+        "state": state,
+        "connection": raw.get("GENERAL.CONNECTION", ""),
+        "ip4": raw.get("IP4.ADDRESS", ""),
+    }
+
+
+def _connection_ssid(name):
+    if not name:
+        return ""
+    result = nmcli(["-g", "802-11-wireless.ssid", "con", "show", name], check=False)
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip()
+
+
+def _connection_mode(name):
+    if not name:
+        return ""
+    result = nmcli(["-g", "802-11-wireless.mode", "con", "show", name], check=False)
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip()
+
+
+def _connectivity():
+    result = nmcli(["-t", "-f", "CONNECTIVITY", "g"], check=False)
+    if result.returncode != 0:
+        return "unknown"
+    return result.stdout.strip()
+
+
+def _connected():
+    state = _connectivity()
+    return state in ("full", "limited", "portal")
+
+
+def _ensure_wifi(cfg):
+    ssid = (cfg.get("wifi") or {}).get("ssid", "").strip()
+    if not ssid:
+        return
+    names = _connection_names()
+    if WIFI_CONN not in names:
+        nmcli(["con", "add", "type", "wifi", "ifname", "wlan0", "con-name", WIFI_CONN, "ssid", ssid])
+    else:
+        nmcli(["con", "modify", WIFI_CONN, "802-11-wireless.ssid", ssid])
+
+    psk = (cfg.get("wifi") or {}).get("psk", "").strip()
+    if psk:
+        nmcli(["con", "modify", WIFI_CONN, "wifi-sec.key-mgmt", "wpa-psk", "wifi-sec.psk", psk])
+    else:
+        nmcli(["con", "modify", WIFI_CONN, "wifi-sec.key-mgmt", "none"])
+
+    nmcli([
+        "con", "modify", WIFI_CONN,
+        "connection.autoconnect", "yes",
+        "connection.autoconnect-priority", "100",
+        "ipv6.method", "ignore",
+    ])
+
+    dhcp = bool((cfg.get("wifi") or {}).get("dhcp", True))
+    if dhcp:
+        nmcli([
+            "con", "modify", WIFI_CONN,
+            "ipv4.method", "auto",
+            "ipv4.addresses", "",
+            "ipv4.gateway", "",
+            "ipv4.dns", "",
+        ])
+    else:
+        address = (cfg.get("wifi") or {}).get("address", "").strip()
+        gateway = (cfg.get("wifi") or {}).get("gateway", "").strip()
+        dns = (cfg.get("wifi") or {}).get("dns", "").strip()
+        if not address:
+            raise RuntimeError("wifi-static-address-missing")
+        args = ["con", "modify", WIFI_CONN, "ipv4.method", "manual", "ipv4.addresses", address]
+        if gateway:
+            args += ["ipv4.gateway", gateway]
+        if dns:
+            args += ["ipv4.dns", dns]
+        nmcli(args)
+
+    nmcli(["con", "up", WIFI_CONN], check=False)
+
+
+def _ensure_ethernet(cfg):
+    names = _connection_names()
+    if ETH_CONN not in names:
+        nmcli(["con", "add", "type", "ethernet", "ifname", "eth0", "con-name", ETH_CONN])
+
+    nmcli([
+        "con", "modify", ETH_CONN,
+        "connection.autoconnect", "yes",
+        "connection.autoconnect-priority", "90",
+        "ipv6.method", "ignore",
+    ])
+
+    dhcp = bool((cfg.get("ethernet") or {}).get("dhcp", True))
+    if dhcp:
+        nmcli([
+            "con", "modify", ETH_CONN,
+            "ipv4.method", "auto",
+            "ipv4.addresses", "",
+            "ipv4.gateway", "",
+            "ipv4.dns", "",
+        ])
+    else:
+        address = (cfg.get("ethernet") or {}).get("address", "").strip()
+        gateway = (cfg.get("ethernet") or {}).get("gateway", "").strip()
+        dns = (cfg.get("ethernet") or {}).get("dns", "").strip()
+        if not address:
+            raise RuntimeError("eth-static-address-missing")
+        args = ["con", "modify", ETH_CONN, "ipv4.method", "manual", "ipv4.addresses", address]
+        if gateway:
+            args += ["ipv4.gateway", gateway]
+        if dns:
+            args += ["ipv4.dns", dns]
+        nmcli(args)
+
+    nmcli(["con", "up", ETH_CONN], check=False)
+
+
+def _rand_string(length):
+    alphabet = string.ascii_letters + string.digits
+    return "".join(random.choice(alphabet) for _ in range(length))
+
+
+def _generate_ap_credentials(cfg):
+    ap_cfg = cfg.get("ap_fallback") or {}
+    prefix = ap_cfg.get("ssid_prefix") or "LEDMatrix"
+    suffix = "".join(random.choice(string.ascii_uppercase + string.digits) for _ in range(4))
+    length = int(ap_cfg.get("password_length") or 12)
+    length = max(8, min(63, length))
+    ap_cfg["ssid"] = f"{prefix}-{suffix}"
+    ap_cfg["password"] = _rand_string(length)
+    cfg["ap_fallback"] = ap_cfg
+    return ap_cfg
+
+
+def _ensure_ap(cfg):
+    ap_cfg = cfg.get("ap_fallback") or {}
+    ssid = ap_cfg.get("ssid")
+    password = ap_cfg.get("password")
+    if not ssid or not password:
+        ap_cfg = _generate_ap_credentials(cfg)
+        ssid = ap_cfg.get("ssid")
+        password = ap_cfg.get("password")
+
+    names = _connection_names()
+    if AP_CONN not in names:
+        nmcli(["con", "add", "type", "wifi", "ifname", "wlan0", "con-name", AP_CONN, "ssid", ssid])
+
+    channel = str(ap_cfg.get("channel") or 6)
+    nmcli([
+        "con", "modify", AP_CONN,
+        "802-11-wireless.mode", "ap",
+        "802-11-wireless.band", "bg",
+        "802-11-wireless.channel", channel,
+        "wifi-sec.key-mgmt", "wpa-psk",
+        "wifi-sec.psk", password,
+        "ipv4.method", "shared",
+        "ipv6.method", "ignore",
+        "connection.autoconnect", "no",
+    ])
+    nmcli(["con", "up", AP_CONN], check=False)
+
+
+def _stop_ap():
+    nmcli(["con", "down", AP_CONN], check=False)
+
+
+def _ap_active():
+    for item in _active_connections():
+        if item.get("name") == AP_CONN:
+            return True
+    return False
+
+
+def _display_ap(ssid, password):
+    text = f"SSID {ssid} PASS {password}"
+    payload = json.dumps({"text": text, "speed_ms": 70}).encode("utf-8")
+    req = urllib.request.Request(
+        "http://127.0.0.1:9090/display/text",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=5):
+            pass
+    except Exception:
+        return False
+    return True
+
+
+def cmd_status(cfg):
+    wifi = _device_info("wlan0")
+    wifi_conn = wifi.get("connection")
+    wifi["ssid"] = _connection_ssid(wifi_conn)
+    wifi["mode"] = _connection_mode(wifi_conn)
+    eth = _device_info("eth0")
+    ap = {
+        "active": _ap_active() or wifi.get("mode") == "ap",
+        "ssid": (cfg.get("ap_fallback") or {}).get("ssid", ""),
+        "password": (cfg.get("ap_fallback") or {}).get("password", ""),
+    }
+    return {
+        "ok": True,
+        "connectivity": _connectivity(),
+        "wifi": wifi,
+        "ethernet": eth,
+        "ap": ap,
+        "config": cfg,
+    }
+
+
+def cmd_apply(cfg):
+    _ensure_wifi(cfg)
+    _ensure_ethernet(cfg)
+    return {"ok": True}
+
+
+def cmd_ap_regenerate(cfg, path):
+    ap_cfg = _generate_ap_credentials(cfg)
+    save_config(path, cfg)
+    _ensure_ap(cfg)
+    _display_ap(ap_cfg.get("ssid"), ap_cfg.get("password"))
+    return {"ok": True, "ap": ap_cfg}
+
+
+def cmd_watch(cfg_path, interval):
+    last_ap = False
+    while True:
+        cfg = load_config(cfg_path)
+        ap_cfg = cfg.get("ap_fallback") or {}
+        enabled = bool(ap_cfg.get("enabled"))
+        ap_active = _ap_active()
+        online = _connected()
+
+        if not enabled:
+            if ap_active:
+                _stop_ap()
+            time.sleep(interval)
+            continue
+
+        if not online and not ap_active:
+            _ensure_ap(cfg)
+            save_config(cfg_path, cfg)
+            _display_ap(ap_cfg.get("ssid"), ap_cfg.get("password"))
+            last_ap = True
+        elif online and ap_active:
+            _stop_ap()
+            _ensure_wifi(cfg)
+            last_ap = False
+
+        time.sleep(interval)
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", default=DEFAULT_CONFIG_PATH)
+    sub = parser.add_subparsers(dest="cmd", required=True)
+
+    sub.add_parser("status")
+    sub.add_parser("apply")
+    sub.add_parser("ap-regenerate")
+    watch = sub.add_parser("watch")
+    watch.add_argument("--interval", type=int, default=5)
+
+    args = parser.parse_args()
+    cfg = load_config(args.config)
+
+    try:
+        if args.cmd == "status":
+            out = cmd_status(cfg)
+        elif args.cmd == "apply":
+            out = cmd_apply(cfg)
+        elif args.cmd == "ap-regenerate":
+            out = cmd_ap_regenerate(cfg, args.config)
+        elif args.cmd == "watch":
+            cmd_watch(args.config, args.interval)
+            return 0
+        else:
+            raise RuntimeError("unknown-command")
+    except Exception as e:
+        print(json.dumps({"ok": False, "detail": str(e)}))
+        return 1
+
+    print(json.dumps(out))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

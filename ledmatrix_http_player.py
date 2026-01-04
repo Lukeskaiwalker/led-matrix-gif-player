@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import ipaddress
 import io
+import json
 import os
+import subprocess
 import threading
 import time
 from typing import Optional, List, Tuple
@@ -9,7 +11,7 @@ from email.utils import formatdate
 
 from fastapi import FastAPI, Request, UploadFile, File, HTTPException, Response
 from fastapi.responses import JSONResponse, HTMLResponse, FileResponse
-from PIL import Image, ImageSequence
+from PIL import Image, ImageSequence, ImageDraw, ImageFont
 
 # -----------------------------------------------------------------------------
 # Paths & runtime dir
@@ -21,6 +23,11 @@ if DEFAULT_GIF_PATH is None:
 MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", "0"))
 MAX_FRAMES = int(os.environ.get("MAX_FRAMES", "0"))
 ALLOW_NETS_RAW = os.environ.get("ALLOW_NETS", "")
+NETWORK_CONFIG_PATH = os.environ.get(
+    "NETWORK_CONFIG_PATH",
+    os.path.join(os.path.expanduser("~"), ".config", "ledmatrix", "network.json"),
+)
+NETWORK_CTL_PATH = os.environ.get("NETWORK_CTL_PATH", "/usr/local/bin/ledmatrix-netctl")
 os.makedirs(RUN_DIR, exist_ok=True)
 
 PATH_LAST = os.path.join(RUN_DIR, "last_payload.bin")
@@ -263,6 +270,122 @@ def _current_brightness() -> int:
     except Exception:
         return 70
 
+def _default_network_config() -> dict:
+    return {
+        "wifi": {
+            "ssid": "",
+            "psk": "",
+            "dhcp": True,
+            "address": "",
+            "gateway": "",
+            "dns": "",
+        },
+        "ethernet": {
+            "dhcp": True,
+            "address": "",
+            "gateway": "",
+            "dns": "",
+        },
+        "ap_fallback": {
+            "enabled": False,
+            "ssid_prefix": "LEDMatrix",
+            "password_length": 12,
+            "ssid": "",
+            "password": "",
+            "channel": 6,
+        },
+    }
+
+def _load_network_config() -> dict:
+    cfg = _default_network_config()
+    try:
+        with open(NETWORK_CONFIG_PATH, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        for section in ("wifi", "ethernet", "ap_fallback"):
+            if isinstance(raw.get(section), dict):
+                cfg[section].update(raw[section])
+    except FileNotFoundError:
+        pass
+    except Exception as e:
+        print("Failed to load network config:", e)
+    return cfg
+
+def _save_network_config(cfg: dict):
+    base_dir = os.path.dirname(NETWORK_CONFIG_PATH)
+    if base_dir:
+        os.makedirs(base_dir, exist_ok=True)
+    with open(NETWORK_CONFIG_PATH, "w", encoding="utf-8") as f:
+        json.dump(cfg, f, indent=2, sort_keys=True, ensure_ascii=True)
+
+def _run_netctl(args: List[str]) -> str:
+    if not NETWORK_CTL_PATH or not os.path.exists(NETWORK_CTL_PATH):
+        raise RuntimeError("network-ctl-missing")
+    cmd = ["sudo", "-n", NETWORK_CTL_PATH, "--config", NETWORK_CONFIG_PATH] + args
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        err = result.stderr.strip() or result.stdout.strip() or "network-ctl-failed"
+        raise RuntimeError(err)
+    return result.stdout
+
+def _netctl_json(args: List[str]) -> dict:
+    out = _run_netctl(args)
+    try:
+        return json.loads(out)
+    except Exception as e:
+        raise RuntimeError(f"network-ctl-bad-json:{e}")
+
+def _parse_rgb(value, default):
+    if isinstance(value, (list, tuple)) and len(value) == 3:
+        try:
+            return tuple(max(0, min(255, int(v))) for v in value)
+        except Exception:
+            return default
+    return default
+
+def _build_text_gif(text: str, speed_ms: int = 70, fg=(255, 255, 255), bg=(0, 0, 0)) -> bytes:
+    mw, mh = _matrix_size()
+    font = ImageFont.load_default()
+    dummy = Image.new("RGB", (1, 1))
+    draw = ImageDraw.Draw(dummy)
+    bbox = draw.textbbox((0, 0), text, font=font)
+    text_w = max(1, bbox[2] - bbox[0])
+    text_h = max(1, bbox[3] - bbox[1])
+    y = max(0, (mh - text_h) // 2)
+
+    if text_w <= mw:
+        frame = Image.new("RGB", (mw, mh), bg)
+        draw = ImageDraw.Draw(frame)
+        draw.text(((mw - text_w) // 2, y), text, font=font, fill=fg)
+        frames = [frame]
+    else:
+        spacer = "   "
+        text_with_space = f"{text}{spacer}"
+        bbox = draw.textbbox((0, 0), text_with_space, font=font)
+        text_w = max(1, bbox[2] - bbox[0])
+        canvas_w = text_w + mw
+        base = Image.new("RGB", (canvas_w, mh), bg)
+        draw = ImageDraw.Draw(base)
+        draw.text((mw, y), text_with_space, font=font, fill=fg)
+        frames = []
+        max_frames = min(canvas_w - mw + 1, 240)
+        for offset in range(max_frames):
+            crop = base.crop((offset, 0, offset + mw, mh))
+            frames.append(crop)
+        if not frames:
+            frames = [base.crop((0, 0, mw, mh))]
+
+    out = io.BytesIO()
+    frames[0].save(
+        out,
+        format="GIF",
+        save_all=True,
+        append_images=frames[1:],
+        duration=max(30, min(500, int(speed_ms))),
+        loop=0,
+        disposal=2,
+    )
+    return out.getvalue()
+
 UI_HTML = """<!doctype html>
 <html lang="en">
   <head>
@@ -492,6 +615,11 @@ UI_HTML = """<!doctype html>
         logBox.style.color = ok ? "#3b4a57" : "#b42318";
       }
 
+      function setNetworkLog(message, ok = true) {
+        networkLog.textContent = message;
+        networkLog.style.color = ok ? "#3b4a57" : "#b42318";
+      }
+
       async function refreshPreview() {
         try {
           const res = await fetch("/current.gif", { method: "HEAD" });
@@ -687,6 +815,19 @@ SETUP_HTML = """<!doctype html>
         border-radius: 10px;
         border: 1px solid var(--border);
       }
+      input[type="text"],
+      input[type="password"],
+      select {
+        width: 100%;
+        padding: 10px;
+        border-radius: 10px;
+        border: 1px solid var(--border);
+        background: rgba(255, 255, 255, 0.9);
+        font-family: inherit;
+      }
+      select {
+        cursor: pointer;
+      }
       input[type="file"] {
         padding: 12px;
         border-radius: 10px;
@@ -767,6 +908,15 @@ SETUP_HTML = """<!doctype html>
         display: grid;
         gap: 12px;
       }
+      .field {
+        display: grid;
+        gap: 6px;
+      }
+      .divider {
+        height: 1px;
+        background: rgba(16, 20, 25, 0.12);
+        margin: 8px 0;
+      }
     </style>
   </head>
   <body>
@@ -796,6 +946,91 @@ SETUP_HTML = """<!doctype html>
           <div class="button-row">
             <button class="ghost" id="clearMatrix">Clear display</button>
             <button class="ghost" id="loadDefault">Load default now</button>
+          </div>
+        </div>
+        <div class="card">
+          <h2>Network Setup</h2>
+          <div class="info-grid">
+            <div class="info-row"><span>Wi-Fi status</span><span id="wifiStatus">--</span></div>
+            <div class="info-row"><span>Wi-Fi IP</span><span id="wifiIp">--</span></div>
+            <div class="info-row"><span>Ethernet status</span><span id="ethStatus">--</span></div>
+            <div class="info-row"><span>Ethernet IP</span><span id="ethIp">--</span></div>
+            <div class="info-row"><span>AP status</span><span id="apStatus">--</span></div>
+            <div class="info-row"><span>AP credentials</span><span id="apCreds">--</span></div>
+          </div>
+          <div class="divider"></div>
+          <div class="stack">
+            <div class="field">
+              <label for="wifiSsid">Wi-Fi SSID</label>
+              <input type="text" id="wifiSsid" placeholder="Network name">
+            </div>
+            <div class="field">
+              <label for="wifiPsk">Wi-Fi Password</label>
+              <input type="password" id="wifiPsk" placeholder="Leave blank to keep current">
+            </div>
+            <div class="field">
+              <label for="wifiMode">Wi-Fi IPv4</label>
+              <select id="wifiMode">
+                <option value="dhcp">DHCP</option>
+                <option value="static">Static</option>
+              </select>
+            </div>
+            <div class="stack" id="wifiStaticFields" style="display:none;">
+              <div class="field">
+                <label for="wifiAddress">Wi-Fi Static IP (CIDR)</label>
+                <input type="text" id="wifiAddress" placeholder="192.168.5.50/24">
+              </div>
+              <div class="field">
+                <label for="wifiGateway">Wi-Fi Gateway</label>
+                <input type="text" id="wifiGateway" placeholder="192.168.5.1">
+              </div>
+              <div class="field">
+                <label for="wifiDns">Wi-Fi DNS</label>
+                <input type="text" id="wifiDns" placeholder="1.1.1.1,8.8.8.8">
+              </div>
+            </div>
+            <div class="divider"></div>
+            <div class="field">
+              <label for="ethMode">Ethernet IPv4</label>
+              <select id="ethMode">
+                <option value="dhcp">DHCP</option>
+                <option value="static">Static</option>
+              </select>
+            </div>
+            <div class="stack" id="ethStaticFields" style="display:none;">
+              <div class="field">
+                <label for="ethAddress">Ethernet Static IP (CIDR)</label>
+                <input type="text" id="ethAddress" placeholder="192.168.5.60/24">
+              </div>
+              <div class="field">
+                <label for="ethGateway">Ethernet Gateway</label>
+                <input type="text" id="ethGateway" placeholder="192.168.5.1">
+              </div>
+              <div class="field">
+                <label for="ethDns">Ethernet DNS</label>
+                <input type="text" id="ethDns" placeholder="1.1.1.1,8.8.8.8">
+              </div>
+            </div>
+            <div class="divider"></div>
+            <div class="field">
+              <label>
+                <input type="checkbox" id="apEnabled">
+                Enable fallback Access Point when offline
+              </label>
+            </div>
+            <div class="field">
+              <label for="apPrefix">AP SSID prefix</label>
+              <input type="text" id="apPrefix" placeholder="LEDMatrix">
+            </div>
+            <div class="field">
+              <label for="apPassLen">AP password length</label>
+              <input type="number" id="apPassLen" min="8" max="63" value="12">
+            </div>
+            <div class="button-row">
+              <button class="primary" id="applyNetwork">Save and apply</button>
+              <button class="ghost" id="regenAp">Regenerate AP credentials</button>
+            </div>
+            <div class="log" id="networkLog">Settings not applied yet.</div>
           </div>
         </div>
         <div class="card">
@@ -833,6 +1068,11 @@ SETUP_HTML = """<!doctype html>
       const logBox = document.getElementById("setupLog");
       const brightnessRange = document.getElementById("brightnessRange");
       const brightnessValue = document.getElementById("brightnessValue");
+      const networkLog = document.getElementById("networkLog");
+      const wifiMode = document.getElementById("wifiMode");
+      const wifiStaticFields = document.getElementById("wifiStaticFields");
+      const ethMode = document.getElementById("ethMode");
+      const ethStaticFields = document.getElementById("ethStaticFields");
 
       function setLog(message, ok = true) {
         logBox.textContent = message;
@@ -854,6 +1094,11 @@ SETUP_HTML = """<!doctype html>
       function formatTime(ts) {
         if (!ts) return "--";
         return new Date(ts * 1000).toLocaleString();
+      }
+
+      function toggleStaticFields() {
+        wifiStaticFields.style.display = wifiMode.value === "static" ? "grid" : "none";
+        ethStaticFields.style.display = ethMode.value === "static" ? "grid" : "none";
       }
 
       async function loadStatus() {
@@ -897,12 +1142,72 @@ SETUP_HTML = """<!doctype html>
         }
       }
 
+      async function loadNetwork() {
+        try {
+          const res = await fetch("/network/status");
+          const data = await res.json();
+          if (!data) {
+            setNetworkLog("Network status failed: empty response", false);
+            return;
+          }
+          if (data.ok === false) {
+            setNetworkLog(`Network status failed: ${data.detail || res.status}`, false);
+          }
+          const wifi = data.wifi || {};
+          const eth = data.ethernet || {};
+          const ap = data.ap || {};
+          const cfg = data.config || {};
+          const wifiCfg = cfg.wifi || {};
+          const ethCfg = cfg.ethernet || {};
+          const apCfg = cfg.ap_fallback || {};
+
+          document.getElementById("wifiStatus").textContent = wifi.ssid
+            ? `${wifi.state || "unknown"} (${wifi.ssid})`
+            : (wifi.state || "unknown");
+          document.getElementById("wifiIp").textContent = wifi.ip4 || "--";
+          document.getElementById("ethStatus").textContent = eth.state || "unknown";
+          document.getElementById("ethIp").textContent = eth.ip4 || "--";
+          const apEnabled = !!apCfg.enabled;
+          document.getElementById("apStatus").textContent = ap.active
+            ? "Active"
+            : (apEnabled ? "Enabled" : "Disabled");
+          const apSsid = ap.ssid || apCfg.ssid || "";
+          const apPass = ap.password || apCfg.password || "";
+          document.getElementById("apCreds").textContent = apSsid && apPass
+            ? `${apSsid} / ${apPass}`
+            : "--";
+
+          if (wifiCfg.ssid !== undefined && wifiCfg.ssid !== "") {
+            document.getElementById("wifiSsid").value = wifiCfg.ssid;
+          }
+          wifiMode.value = wifiCfg.dhcp ? "dhcp" : "static";
+          document.getElementById("wifiAddress").value = wifiCfg.address || "";
+          document.getElementById("wifiGateway").value = wifiCfg.gateway || "";
+          document.getElementById("wifiDns").value = wifiCfg.dns || "";
+
+          ethMode.value = ethCfg.dhcp ? "dhcp" : "static";
+          document.getElementById("ethAddress").value = ethCfg.address || "";
+          document.getElementById("ethGateway").value = ethCfg.gateway || "";
+          document.getElementById("ethDns").value = ethCfg.dns || "";
+
+          document.getElementById("apEnabled").checked = apEnabled;
+          document.getElementById("apPrefix").value = apCfg.ssid_prefix || "LEDMatrix";
+          document.getElementById("apPassLen").value = apCfg.password_length || 12;
+
+          toggleStaticFields();
+        } catch (err) {
+          setNetworkLog("Network status failed: network error", false);
+        }
+      }
+
       brightnessRange.addEventListener("input", () => {
         brightnessValue.value = brightnessRange.value;
       });
       brightnessValue.addEventListener("input", () => {
         brightnessRange.value = brightnessValue.value;
       });
+      wifiMode.addEventListener("change", toggleStaticFields);
+      ethMode.addEventListener("change", toggleStaticFields);
 
       document.getElementById("applyBrightness").addEventListener("click", async () => {
         const value = parseInt(brightnessRange.value, 10);
@@ -997,9 +1302,69 @@ SETUP_HTML = """<!doctype html>
         }
       });
 
+      document.getElementById("applyNetwork").addEventListener("click", async () => {
+        const payload = {
+          wifi: {
+            ssid: document.getElementById("wifiSsid").value.trim(),
+            psk: document.getElementById("wifiPsk").value.trim(),
+            dhcp: wifiMode.value === "dhcp",
+            address: document.getElementById("wifiAddress").value.trim(),
+            gateway: document.getElementById("wifiGateway").value.trim(),
+            dns: document.getElementById("wifiDns").value.trim()
+          },
+          ethernet: {
+            dhcp: ethMode.value === "dhcp",
+            address: document.getElementById("ethAddress").value.trim(),
+            gateway: document.getElementById("ethGateway").value.trim(),
+            dns: document.getElementById("ethDns").value.trim()
+          },
+          ap_fallback: {
+            enabled: document.getElementById("apEnabled").checked,
+            ssid_prefix: document.getElementById("apPrefix").value.trim(),
+            password_length: parseInt(document.getElementById("apPassLen").value || "12", 10)
+          },
+          apply: true
+        };
+        setNetworkLog("Applying network settings... this may disconnect.", true);
+        try {
+          const res = await fetch("/network/config", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(payload)
+          });
+          const data = await res.json();
+          if (!res.ok || data.ok === false) {
+            setNetworkLog(`Apply failed: ${data.detail || res.status}`, false);
+            return;
+          }
+          setNetworkLog("Network settings saved. If you lose connection, use the fallback AP.", true);
+          loadNetwork();
+        } catch (err) {
+          setNetworkLog("Apply failed: network error", false);
+        }
+      });
+
+      document.getElementById("regenAp").addEventListener("click", async () => {
+        setNetworkLog("Regenerating AP credentials...", true);
+        try {
+          const res = await fetch("/network/ap/regenerate", { method: "POST" });
+          const data = await res.json();
+          if (!res.ok || data.ok === false) {
+            setNetworkLog(`Regenerate failed: ${data.detail || res.status}`, false);
+            return;
+          }
+          setNetworkLog("AP credentials regenerated.", true);
+          loadNetwork();
+        } catch (err) {
+          setNetworkLog("Regenerate failed: network error", false);
+        }
+      });
+
       document.getElementById("refreshStatus").addEventListener("click", loadStatus);
       loadStatus();
+      loadNetwork();
       setInterval(loadStatus, 5000);
+      setInterval(loadNetwork, 8000);
     </script>
   </body>
 </html>
@@ -1127,7 +1492,8 @@ def root():
         "clear": "curl -X POST http://<pi>:9090/clear",
         "ui": "http://<pi>:9090/ui",
         "setup": "http://<pi>:9090/setup",
-        "status": "http://<pi>:9090/status"
+        "status": "http://<pi>:9090/status",
+        "network_status": "http://<pi>:9090/network/status"
     })
 
 @app.get("/ui")
@@ -1160,6 +1526,49 @@ def status():
         },
     }
 
+@app.get("/network/status")
+def network_status():
+    cfg = _load_network_config()
+    try:
+        data = _netctl_json(["status"])
+        data.setdefault("config", cfg)
+        return data
+    except Exception as e:
+        return {"ok": False, "detail": str(e), "config": cfg}
+
+@app.post("/network/config")
+async def network_config(request: Request):
+    try:
+        body = await request.json()
+        cfg = _load_network_config()
+        if isinstance(body.get("wifi"), dict):
+            wifi_in = body["wifi"].copy()
+            if wifi_in.get("ssid") == "":
+                wifi_in.pop("ssid", None)
+            if wifi_in.get("psk") == "":
+                wifi_in.pop("psk", None)
+            cfg["wifi"].update(wifi_in)
+        if isinstance(body.get("ethernet"), dict):
+            cfg["ethernet"].update(body["ethernet"])
+        if isinstance(body.get("ap_fallback"), dict):
+            cfg["ap_fallback"].update(body["ap_fallback"])
+        _save_network_config(cfg)
+        if body.get("apply"):
+            _run_netctl(["apply"])
+        return {"ok": True, "config": cfg}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"network-config-failed:{e}")
+
+@app.post("/network/ap/regenerate")
+def network_ap_regenerate():
+    try:
+        data = _netctl_json(["ap-regenerate"])
+        return data
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"ap-regenerate-failed:{e}")
+
 @app.get("/current.gif")
 def current_gif():
     if not os.path.exists(CURRENT_GIF):
@@ -1171,6 +1580,25 @@ def head_current_gif():
     if not os.path.exists(CURRENT_GIF):
         raise HTTPException(status_code=404, detail="no-current-gif")
     return Response(status_code=200, headers=_file_stat_headers(CURRENT_GIF))
+
+@app.post("/display/text")
+async def display_text(request: Request):
+    try:
+        body = await request.json()
+        text = str(body.get("text", "")).strip()
+        if not text:
+            raise HTTPException(status_code=400, detail="text-required")
+        speed_ms = int(body.get("speed_ms", 70))
+        fg = _parse_rgb(body.get("fg"), (255, 255, 255))
+        bg = _parse_rgb(body.get("bg"), (0, 0, 0))
+        data = _build_text_gif(text, speed_ms=speed_ms, fg=fg, bg=bg)
+        _atomic_write(PATH_CURR, data)
+        CHANGE_EVENT.set()
+        return {"ok": True, "bytes": len(data)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"display-text-failed:{e}")
 
 @app.post("/default/current")
 def set_default_current():

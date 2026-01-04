@@ -11,10 +11,14 @@ The service running on the Pi is `ledmatrix_http_player.py`.
 - `GET /ui` (web UI)
 - `GET /setup` (setup UI)
 - `GET /current.gif` (preview of current GIF)
+- `POST /display/text` (render text to the matrix)
 - `GET /status` (JSON status/config snapshot)
 - `POST /default/current` (save current GIF as default)
 - `POST /default/load` (load default GIF into the player)
 - `POST /default/upload` (upload default GIF without playing)
+- `GET /network/status` (network status/config; requires netctl helper)
+- `POST /network/config` (save/apply network config; requires netctl helper)
+- `POST /network/ap/regenerate` (new AP SSID/password; requires netctl helper)
 
 ### Examples
 ```bash
@@ -25,6 +29,7 @@ curl -X POST http://<pi>:9090/clear
 curl -X POST http://<pi>:9090/default/current
 curl -X POST http://<pi>:9090/default/load
 curl -F 'file=@/home/pi/test.gif;type=image/gif' http://<pi>:9090/default/upload
+curl -X POST -H 'Content-Type: application/json' -d '{\"text\":\"SSID LEDMatrix PASS 12345678\"}' http://<pi>:9090/display/text
 ```
 
 ## Configuration (env vars)
@@ -39,6 +44,16 @@ curl -F 'file=@/home/pi/test.gif;type=image/gif' http://<pi>:9090/default/upload
 ## Web UI
 Open `http://<pi>:9090/ui` for a live preview and manual upload.
 Open `http://<pi>:9090/setup` for brightness controls, defaults, and system status.
+
+## Network setup (optional)
+This repo includes a helper script and systemd unit for network config + AP fallback:
+- `scripts/ledmatrix-netctl`
+- `systemd/ledmatrix-netwatch.service`
+
+The web UI uses these endpoints, which rely on the helper script running with sudo:
+- `GET /network/status`
+- `POST /network/config`
+- `POST /network/ap/regenerate`
 
 ## Run locally on the Pi
 ```bash

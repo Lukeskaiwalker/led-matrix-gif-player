@@ -20,6 +20,7 @@ if DEFAULT_GIF_PATH is None:
     DEFAULT_GIF_PATH = os.path.join(os.path.expanduser("~"), "ledmatrix_default.gif")
 MAX_UPLOAD_BYTES = int(os.environ.get("MAX_UPLOAD_BYTES", "0"))
 MAX_FRAMES = int(os.environ.get("MAX_FRAMES", "0"))
+ALLOW_NETS_RAW = os.environ.get("ALLOW_NETS", "")
 os.makedirs(RUN_DIR, exist_ok=True)
 
 PATH_LAST = os.path.join(RUN_DIR, "last_payload.bin")
@@ -41,7 +42,7 @@ def _parse_allow_nets(raw: str):
             print(f"Invalid ALLOW_NETS entry: {part}")
     return nets or None
 
-ALLOW_NETS = _parse_allow_nets(os.environ.get("ALLOW_NETS", ""))
+ALLOW_NETS = _parse_allow_nets(ALLOW_NETS_RAW)
 
 # Event to interrupt the player loop when a new file arrives
 CHANGE_EVENT = threading.Event()
@@ -241,6 +242,27 @@ def _file_stat_headers(path: str) -> dict:
         "Content-Type": "image/gif",
     }
 
+def _file_info(path: str) -> dict:
+    if not path or not os.path.exists(path):
+        return {"exists": False}
+    try:
+        st = os.stat(path)
+        return {"exists": True, "bytes": st.st_size, "mtime": int(st.st_mtime)}
+    except Exception:
+        return {"exists": False}
+
+def _current_brightness() -> int:
+    m = get_matrix()
+    if m is not None:
+        try:
+            return int(getattr(m, "brightness"))
+        except Exception:
+            pass
+    try:
+        return int(os.environ.get("LED_BRIGHTNESS", "70"))
+    except Exception:
+        return 70
+
 UI_HTML = """<!doctype html>
 <html lang="en">
   <head>
@@ -284,9 +306,33 @@ UI_HTML = """<!doctype html>
       }
       header {
         display: flex;
-        align-items: baseline;
+        align-items: center;
+        justify-content: space-between;
         gap: 16px;
         margin-bottom: 28px;
+        flex-wrap: wrap;
+      }
+      header .title {
+        min-width: 220px;
+      }
+      nav {
+        display: flex;
+        gap: 10px;
+        align-items: center;
+      }
+      nav a {
+        text-decoration: none;
+        font-size: 13px;
+        padding: 8px 12px;
+        border-radius: 999px;
+        color: var(--muted);
+        border: 1px solid var(--border);
+        background: rgba(255, 255, 255, 0.6);
+      }
+      nav a.active {
+        color: var(--ink);
+        border-color: rgba(12, 18, 26, 0.6);
+        background: #ffffff;
       }
       header h1 {
         margin: 0;
@@ -399,8 +445,14 @@ UI_HTML = """<!doctype html>
     <div class="grid"></div>
     <main>
       <header>
-        <h1>LED Matrix GIF Player</h1>
-        <p>Live preview + manual upload</p>
+        <div class="title">
+          <h1>LED Matrix GIF Player</h1>
+          <p>Live preview + manual upload</p>
+        </div>
+        <nav>
+          <a class="active" href="/ui">Preview</a>
+          <a href="/setup">Setup</a>
+        </nav>
       </header>
       <section class="panel">
         <div class="card">
@@ -447,6 +499,7 @@ UI_HTML = """<!doctype html>
             statusText.textContent = "No GIF playing";
             preview.style.display = "none";
             previewEmpty.style.display = "block";
+            updatedAt.textContent = "--";
             return;
           }
           const lm = res.headers.get("Last-Modified") || "";
@@ -460,6 +513,7 @@ UI_HTML = """<!doctype html>
           previewEmpty.style.display = "none";
         } catch (err) {
           statusText.textContent = "Offline";
+          updatedAt.textContent = "--";
         }
       }
 
@@ -509,6 +563,433 @@ UI_HTML = """<!doctype html>
 
       refreshPreview();
       setInterval(refreshPreview, 2000);
+    </script>
+  </body>
+</html>
+"""
+
+SETUP_HTML = """<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>LED Matrix Setup</title>
+    <style>
+      @import url("https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600&display=swap");
+      :root {
+        --bg-1: #132026;
+        --bg-2: #f6efe0;
+        --ink: #0b0f14;
+        --muted: #55606a;
+        --accent: #0f8b8d;
+        --accent-2: #f29f05;
+        --card: #fff6e5;
+        --border: rgba(16, 20, 25, 0.15);
+        --shadow: 0 18px 40px rgba(9, 15, 20, 0.18);
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        font-family: "Space Grotesk", "Trebuchet MS", sans-serif;
+        color: var(--ink);
+        background: radial-gradient(900px 500px at 90% -10%, #ffd9b0 0%, transparent 60%),
+                    linear-gradient(135deg, var(--bg-1), var(--bg-2));
+        min-height: 100vh;
+      }
+      .grid {
+        position: fixed;
+        inset: 0;
+        background-image: linear-gradient(rgba(12, 18, 26, 0.06) 1px, transparent 1px),
+                          linear-gradient(90deg, rgba(12, 18, 26, 0.06) 1px, transparent 1px);
+        background-size: 28px 28px;
+        pointer-events: none;
+      }
+      main {
+        max-width: 1100px;
+        margin: 0 auto;
+        padding: 46px 20px 70px;
+      }
+      header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+        margin-bottom: 28px;
+        flex-wrap: wrap;
+      }
+      header h1 {
+        margin: 0;
+        font-size: clamp(26px, 4vw, 38px);
+      }
+      header p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 14px;
+      }
+      nav {
+        display: flex;
+        gap: 10px;
+        align-items: center;
+      }
+      nav a {
+        text-decoration: none;
+        font-size: 13px;
+        padding: 8px 12px;
+        border-radius: 999px;
+        color: var(--muted);
+        border: 1px solid var(--border);
+        background: rgba(255, 255, 255, 0.65);
+      }
+      nav a.active {
+        color: var(--ink);
+        border-color: rgba(15, 25, 35, 0.6);
+        background: #ffffff;
+      }
+      .panel {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+        gap: 22px;
+      }
+      .card {
+        background: var(--card);
+        border: 1px solid var(--border);
+        border-radius: 18px;
+        padding: 20px;
+        box-shadow: var(--shadow);
+        animation: rise 500ms ease both;
+      }
+      .card:nth-child(2) { animation-delay: 70ms; }
+      .card:nth-child(3) { animation-delay: 140ms; }
+      @keyframes rise {
+        from { opacity: 0; transform: translateY(16px); }
+        to { opacity: 1; transform: translateY(0); }
+      }
+      .card h2 {
+        margin: 0 0 12px;
+        font-size: 18px;
+      }
+      .control-row {
+        display: grid;
+        gap: 12px;
+        margin-bottom: 12px;
+      }
+      .range-wrap {
+        display: grid;
+        grid-template-columns: 1fr 72px;
+        gap: 10px;
+        align-items: center;
+      }
+      input[type="range"] {
+        width: 100%;
+      }
+      input[type="number"] {
+        padding: 8px;
+        border-radius: 10px;
+        border: 1px solid var(--border);
+      }
+      input[type="file"] {
+        padding: 12px;
+        border-radius: 10px;
+        border: 1px dashed var(--border);
+        background: rgba(255, 255, 255, 0.7);
+      }
+      label {
+        font-size: 13px;
+        color: var(--muted);
+      }
+      button {
+        border: none;
+        border-radius: 12px;
+        padding: 10px 14px;
+        font-weight: 600;
+        cursor: pointer;
+        transition: transform 120ms ease, box-shadow 120ms ease;
+      }
+      button.primary {
+        background: var(--accent);
+        color: #fff;
+        box-shadow: 0 12px 22px rgba(15, 139, 141, 0.25);
+      }
+      button.secondary {
+        background: var(--accent-2);
+        color: #fff;
+        box-shadow: 0 12px 22px rgba(242, 159, 5, 0.2);
+      }
+      button.ghost {
+        background: rgba(255, 255, 255, 0.8);
+        border: 1px solid var(--border);
+        color: var(--ink);
+      }
+      button:active {
+        transform: translateY(1px);
+      }
+      .button-row {
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+      }
+      .info-grid {
+        display: grid;
+        gap: 10px;
+        font-size: 13px;
+        color: var(--muted);
+        margin-bottom: 10px;
+      }
+      .info-row {
+        display: flex;
+        justify-content: space-between;
+        gap: 12px;
+      }
+      .info-row span:last-child {
+        color: var(--ink);
+        text-align: right;
+      }
+      .log {
+        margin-top: 12px;
+        padding: 10px 12px;
+        border-radius: 10px;
+        background: rgba(255, 255, 255, 0.65);
+        font-size: 13px;
+        color: var(--muted);
+        min-height: 44px;
+      }
+      .stack {
+        display: grid;
+        gap: 12px;
+      }
+    </style>
+  </head>
+  <body>
+    <div class="grid"></div>
+    <main>
+      <header>
+        <div class="title">
+          <h1>Setup Console</h1>
+          <p>Brightness, defaults, and system settings.</p>
+        </div>
+        <nav>
+          <a href="/ui">Preview</a>
+          <a class="active" href="/setup">Setup</a>
+        </nav>
+      </header>
+      <section class="panel">
+        <div class="card">
+          <h2>Playback Controls</h2>
+          <div class="control-row">
+            <label for="brightnessRange">Brightness</label>
+            <div class="range-wrap">
+              <input type="range" id="brightnessRange" min="1" max="100" value="70">
+              <input type="number" id="brightnessValue" min="1" max="100" value="70">
+            </div>
+            <button class="primary" id="applyBrightness">Apply brightness</button>
+          </div>
+          <div class="button-row">
+            <button class="ghost" id="clearMatrix">Clear display</button>
+            <button class="ghost" id="loadDefault">Load default now</button>
+          </div>
+        </div>
+        <div class="card">
+          <h2>Default GIF</h2>
+          <div class="info-grid">
+            <div class="info-row"><span>Default path</span><span id="defaultPath">--</span></div>
+            <div class="info-row"><span>Default status</span><span id="defaultInfo">--</span></div>
+          </div>
+          <form id="uploadDefaultForm" class="stack">
+            <input type="file" id="defaultFile" accept="image/gif">
+            <button class="secondary" type="submit">Upload default only</button>
+          </form>
+          <div class="button-row" style="margin-top:12px;">
+            <button class="ghost" id="setCurrentDefault">Set current as default</button>
+          </div>
+        </div>
+        <div class="card">
+          <h2>System Status</h2>
+          <div class="info-grid">
+            <div class="info-row"><span>Current GIF</span><span id="currentInfo">--</span></div>
+            <div class="info-row"><span>Runtime dir</span><span id="runtimeDir">--</span></div>
+            <div class="info-row"><span>Matrix size</span><span id="matrixSize">--</span></div>
+            <div class="info-row"><span>Hardware mapping</span><span id="hardwareMapping">--</span></div>
+            <div class="info-row"><span>Brightness</span><span id="brightnessInfo">--</span></div>
+            <div class="info-row"><span>Allow nets</span><span id="allowNets">--</span></div>
+            <div class="info-row"><span>Max upload</span><span id="maxUpload">--</span></div>
+            <div class="info-row"><span>Max frames</span><span id="maxFrames">--</span></div>
+          </div>
+          <button class="ghost" id="refreshStatus">Refresh status</button>
+          <div class="log" id="setupLog">Ready.</div>
+        </div>
+      </section>
+    </main>
+    <script>
+      const logBox = document.getElementById("setupLog");
+      const brightnessRange = document.getElementById("brightnessRange");
+      const brightnessValue = document.getElementById("brightnessValue");
+
+      function setLog(message, ok = true) {
+        logBox.textContent = message;
+        logBox.style.color = ok ? "#3b4a57" : "#b42318";
+      }
+
+      function formatBytes(bytes) {
+        if (!bytes && bytes !== 0) return "--";
+        const units = ["B", "KB", "MB", "GB"];
+        let idx = 0;
+        let value = Number(bytes);
+        while (value >= 1024 && idx < units.length - 1) {
+          value /= 1024;
+          idx += 1;
+        }
+        return `${value.toFixed(value < 10 ? 1 : 0)} ${units[idx]}`;
+      }
+
+      function formatTime(ts) {
+        if (!ts) return "--";
+        return new Date(ts * 1000).toLocaleString();
+      }
+
+      async function loadStatus() {
+        try {
+          const res = await fetch("/status");
+          const data = await res.json();
+          if (!res.ok) {
+            setLog(`Status failed: ${data.detail || res.status}`, false);
+            return;
+          }
+          const current = data.current || {};
+          const def = data.default || {};
+          const cfg = data.config || {};
+
+          document.getElementById("currentInfo").textContent = current.exists
+            ? `${formatBytes(current.bytes)} / ${formatTime(current.mtime)}`
+            : "Not set";
+
+          document.getElementById("defaultPath").textContent = def.path || "Disabled";
+          document.getElementById("defaultInfo").textContent = def.exists
+            ? `${formatBytes(def.bytes)} / ${formatTime(def.mtime)}`
+            : "Missing";
+
+          document.getElementById("runtimeDir").textContent = cfg.runtime_dir || "--";
+          document.getElementById("matrixSize").textContent =
+            cfg.cols && cfg.rows ? `${cfg.cols} x ${cfg.rows}` : "--";
+          document.getElementById("hardwareMapping").textContent = cfg.hardware_mapping || "--";
+          document.getElementById("brightnessInfo").textContent = cfg.brightness || "--";
+          document.getElementById("allowNets").textContent = cfg.allow_nets || "none";
+          document.getElementById("maxUpload").textContent = cfg.max_upload_bytes
+            ? formatBytes(cfg.max_upload_bytes)
+            : "No limit";
+          document.getElementById("maxFrames").textContent = cfg.max_frames || "No limit";
+
+          if (cfg.brightness) {
+            brightnessRange.value = cfg.brightness;
+            brightnessValue.value = cfg.brightness;
+          }
+        } catch (err) {
+          setLog("Status failed: network error", false);
+        }
+      }
+
+      brightnessRange.addEventListener("input", () => {
+        brightnessValue.value = brightnessRange.value;
+      });
+      brightnessValue.addEventListener("input", () => {
+        brightnessRange.value = brightnessValue.value;
+      });
+
+      document.getElementById("applyBrightness").addEventListener("click", async () => {
+        const value = parseInt(brightnessRange.value, 10);
+        if (Number.isNaN(value)) {
+          setLog("Brightness must be a number.", false);
+          return;
+        }
+        try {
+          const res = await fetch("/brightness", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ value })
+          });
+          const data = await res.json();
+          if (!res.ok) {
+            setLog(`Brightness failed: ${data.detail || res.status}`, false);
+            return;
+          }
+          setLog(`Brightness set to ${data.brightness}.`);
+          loadStatus();
+        } catch (err) {
+          setLog("Brightness failed: network error", false);
+        }
+      });
+
+      document.getElementById("clearMatrix").addEventListener("click", async () => {
+        try {
+          const res = await fetch("/clear", { method: "POST" });
+          const data = await res.json();
+          if (!res.ok) {
+            setLog(`Clear failed: ${data.detail || res.status}`, false);
+            return;
+          }
+          setLog("Display cleared.");
+        } catch (err) {
+          setLog("Clear failed: network error", false);
+        }
+      });
+
+      document.getElementById("loadDefault").addEventListener("click", async () => {
+        try {
+          const res = await fetch("/default/load", { method: "POST" });
+          const data = await res.json();
+          if (!res.ok) {
+            setLog(`Load failed: ${data.detail || res.status}`, false);
+            return;
+          }
+          setLog(`Default loaded (${data.bytes} bytes).`);
+          loadStatus();
+        } catch (err) {
+          setLog("Load failed: network error", false);
+        }
+      });
+
+      document.getElementById("setCurrentDefault").addEventListener("click", async () => {
+        try {
+          const res = await fetch("/default/current", { method: "POST" });
+          const data = await res.json();
+          if (!res.ok) {
+            setLog(`Default failed: ${data.detail || res.status}`, false);
+            return;
+          }
+          setLog(`Default saved (${data.bytes} bytes).`);
+          loadStatus();
+        } catch (err) {
+          setLog("Default failed: network error", false);
+        }
+      });
+
+      document.getElementById("uploadDefaultForm").addEventListener("submit", async (event) => {
+        event.preventDefault();
+        const fileInput = document.getElementById("defaultFile");
+        const file = fileInput.files[0];
+        if (!file) {
+          setLog("Choose a GIF for default first.", false);
+          return;
+        }
+        const formData = new FormData();
+        formData.append("file", file);
+        setLog("Uploading default...");
+        try {
+          const res = await fetch("/default/upload", { method: "POST", body: formData });
+          const data = await res.json();
+          if (!res.ok) {
+            setLog(`Upload failed: ${data.detail || res.status}`, false);
+            return;
+          }
+          setLog(`Default uploaded (${data.bytes} bytes).`);
+          loadStatus();
+        } catch (err) {
+          setLog("Upload failed: network error", false);
+        }
+      });
+
+      document.getElementById("refreshStatus").addEventListener("click", loadStatus);
+      loadStatus();
+      setInterval(loadStatus, 5000);
     </script>
   </body>
 </html>
@@ -634,12 +1115,40 @@ def root():
         "hint_multipart": "curl -F 'file=@/home/pi/test.gif;type=image/gif' http://<pi>:9090/upload",
         "brightness": "curl -X POST -H 'Content-Type: application/json' -d '{\"value\":60}' http://<pi>:9090/brightness",
         "clear": "curl -X POST http://<pi>:9090/clear",
-        "ui": "http://<pi>:9090/ui"
+        "ui": "http://<pi>:9090/ui",
+        "setup": "http://<pi>:9090/setup",
+        "status": "http://<pi>:9090/status"
     })
 
 @app.get("/ui")
 def ui():
     return HTMLResponse(UI_HTML)
+
+@app.get("/setup")
+def setup():
+    return HTMLResponse(SETUP_HTML)
+
+@app.get("/status")
+def status():
+    mw, mh = _matrix_size()
+    return {
+        "ok": True,
+        "current": _file_info(CURRENT_GIF),
+        "default": {
+            "path": DEFAULT_GIF_PATH or "",
+            **_file_info(DEFAULT_GIF_PATH),
+        },
+        "config": {
+            "runtime_dir": RUN_DIR,
+            "allow_nets": ALLOW_NETS_RAW,
+            "rows": mh,
+            "cols": mw,
+            "brightness": _current_brightness(),
+            "hardware_mapping": os.environ.get("LED_HARDWARE_MAPPING", "regular"),
+            "max_upload_bytes": MAX_UPLOAD_BYTES,
+            "max_frames": MAX_FRAMES,
+        },
+    }
 
 @app.get("/current.gif")
 def current_gif():
@@ -669,3 +1178,40 @@ def set_default_current():
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"default-failed:{e}")
+
+@app.post("/default/load")
+def load_default():
+    if not DEFAULT_GIF_PATH or not os.path.exists(DEFAULT_GIF_PATH):
+        raise HTTPException(status_code=404, detail="no-default-gif")
+    try:
+        with open(DEFAULT_GIF_PATH, "rb") as f:
+            data = f.read()
+        if not data:
+            raise HTTPException(status_code=400, detail="default-gif-empty")
+        decode_gif_frames(data)
+        _atomic_write(PATH_CURR, data)
+        CHANGE_EVENT.set()
+        return {"ok": True, "bytes": len(data)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"default-load-failed:{e}")
+
+@app.post("/default/upload")
+async def upload_default(file: UploadFile = File(...)):
+    try:
+        data = await file.read()
+        if not data:
+            raise HTTPException(status_code=400, detail="upload-failed:empty-body")
+        if MAX_UPLOAD_BYTES and len(data) > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413, detail="upload-too-large")
+        try:
+            _frames, _durations = decode_gif_frames(data)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"bad-image:{e}")
+        _write_default_gif(data)
+        return {"ok": True, "bytes": len(data), "path": DEFAULT_GIF_PATH or ""}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"default-upload-failed:{e}")

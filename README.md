@@ -9,8 +9,12 @@ The service running on the Pi is `ledmatrix_http_player.py`.
 - `POST /brightness` with JSON `{ "value": 1..100 }`
 - `POST /clear`
 - `GET /ui` (web UI)
+- `GET /setup` (setup UI)
 - `GET /current.gif` (preview of current GIF)
+- `GET /status` (JSON status/config snapshot)
 - `POST /default/current` (save current GIF as default)
+- `POST /default/load` (load default GIF into the player)
+- `POST /default/upload` (upload default GIF without playing)
 
 ### Examples
 ```bash
@@ -19,6 +23,8 @@ curl -F 'file=@/home/pi/test.gif;type=image/gif' http://<pi>:9090/upload
 curl -X POST -H 'Content-Type: application/json' -d '{"value":60}' http://<pi>:9090/brightness
 curl -X POST http://<pi>:9090/clear
 curl -X POST http://<pi>:9090/default/current
+curl -X POST http://<pi>:9090/default/load
+curl -F 'file=@/home/pi/test.gif;type=image/gif' http://<pi>:9090/default/upload
 ```
 
 ## Configuration (env vars)
@@ -31,7 +37,8 @@ curl -X POST http://<pi>:9090/default/current
 - `MAX_FRAMES` (optional frame count limit)
 
 ## Web UI
-Open `http://<pi>:9090/ui` for a live preview, manual upload, and to set the default GIF.
+Open `http://<pi>:9090/ui` for a live preview and manual upload.
+Open `http://<pi>:9090/setup` for brightness controls, defaults, and system status.
 
 ## Run locally on the Pi
 ```bash

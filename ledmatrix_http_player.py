@@ -5,8 +5,9 @@ import os
 import threading
 import time
 from typing import Optional, List, Tuple
+from email.utils import formatdate
 
-from fastapi import FastAPI, Request, UploadFile, File, HTTPException
+from fastapi import FastAPI, Request, UploadFile, File, HTTPException, Response
 from fastapi.responses import JSONResponse, HTMLResponse, FileResponse
 from PIL import Image, ImageSequence
 
@@ -230,6 +231,15 @@ def _write_default_gif(data: bytes):
     if default_dir:
         os.makedirs(default_dir, exist_ok=True)
     _atomic_write(DEFAULT_GIF_PATH, data)
+
+def _file_stat_headers(path: str) -> dict:
+    st = os.stat(path)
+    return {
+        "Cache-Control": "no-store",
+        "Content-Length": str(st.st_size),
+        "Last-Modified": formatdate(st.st_mtime, usegmt=True),
+        "Content-Type": "image/gif",
+    }
 
 UI_HTML = """<!doctype html>
 <html lang="en">
@@ -636,6 +646,12 @@ def current_gif():
     if not os.path.exists(CURRENT_GIF):
         raise HTTPException(status_code=404, detail="no-current-gif")
     return FileResponse(CURRENT_GIF, media_type="image/gif", headers={"Cache-Control": "no-store"})
+
+@app.head("/current.gif")
+def head_current_gif():
+    if not os.path.exists(CURRENT_GIF):
+        raise HTTPException(status_code=404, detail="no-current-gif")
+    return Response(status_code=200, headers=_file_stat_headers(CURRENT_GIF))
 
 @app.post("/default/current")
 def set_default_current():

@@ -14,6 +14,7 @@ UMask=000
 Environment=PYTHONUNBUFFERED=1
 Environment=LED_RUNTIME_DIR=/run/ledmatrix
 Environment=ALLOW_NETS=127.0.0.1/32,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12
+Environment=DEFAULT_GIF_PATH=/home/pi/ledmatrix_default.gif
 Environment=LED_HARDWARE_MAPPING=regular
 Environment=LED_ROWS=64
 Environment=LED_COLS=64

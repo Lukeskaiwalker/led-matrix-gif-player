@@ -112,10 +112,16 @@ def _device_info(device):
         state = "disconnected"
     elif state_raw:
         state = state_raw
+    ip4 = raw.get("IP4.ADDRESS", "")
+    if not ip4:
+        for key, val in raw.items():
+            if key.startswith("IP4.ADDRESS") and val:
+                ip4 = val
+                break
     return {
         "state": state,
         "connection": raw.get("GENERAL.CONNECTION", ""),
-        "ip4": raw.get("IP4.ADDRESS", ""),
+        "ip4": ip4,
     }
 
 

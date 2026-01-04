@@ -1,0 +1,27 @@
+[Unit]
+Description=LED Matrix HTTP Player (upload & play)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/run/ledmatrix
+RuntimeDirectory=ledmatrix
+RuntimeDirectoryMode=0777
+UMask=000
+Environment=PYTHONUNBUFFERED=1
+Environment=LED_RUNTIME_DIR=/run/ledmatrix
+Environment=ALLOW_NETS=127.0.0.1/32,192.168.0.0/16,10.0.0.0/8,172.16.0.0/12
+Environment=LED_HARDWARE_MAPPING=regular
+Environment=LED_ROWS=64
+Environment=LED_COLS=64
+Environment=LED_BRIGHTNESS=70
+Environment=LED_NO_HARDWARE_PULSE=1
+ExecStart=/home/pi/ledmatrix-venv/bin/python -m uvicorn --app-dir /home/pi ledmatrix_http_player:app --host 0.0.0.0 --port 9090
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

@@ -736,13 +736,23 @@ SETUP_HTML = """<!doctype html>
         margin-bottom: 10px;
       }
       .info-row {
-        display: flex;
-        justify-content: space-between;
+        display: grid;
+        grid-template-columns: minmax(140px, 1fr) minmax(160px, 1.3fr);
         gap: 12px;
+        align-items: start;
       }
       .info-row span:last-child {
         color: var(--ink);
         text-align: right;
+        word-break: break-word;
+      }
+      @media (max-width: 640px) {
+        .info-row {
+          grid-template-columns: 1fr;
+        }
+        .info-row span:last-child {
+          text-align: left;
+        }
       }
       .log {
         margin-top: 12px;
